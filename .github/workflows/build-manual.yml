@@ -49,11 +49,35 @@ jobs:
         distribution: "temurin"
         java-version: "17"
 
+    - name: Resolve NDK version for this frida release
+      id: ndk
+      shell: bash
+      run: |
+        set -euo pipefail
+        # frida pins one NDK per release and hard-fails otherwise:
+        #   "NDK r25 is required (found r29, which is unsupported)"
+        # Verified against releng/env_android.py NDK_REQUIRED:
+        #   16.7.19 -> 25, 17.6.2 -> 25, 17.7.0 -> 25,
+        #   17.10.0 -> 29, 17.12.0 -> 29, 17.15.0 -> 29, 17.20.0 -> 29, 17.23.1 -> 29, 17.26.0 -> 29
+        v_major=${FRIDA_VERSION%%.*}
+        v_rest=${FRIDA_VERSION#*.}
+        v_minor=${v_rest%%.*}
+        if [ "$v_major" -lt 17 ]; then
+          ndk=r25
+
+        elif [ "$v_major" -eq 17 ] && [ "$v_minor" -le 7 ]; then
+          ndk=r25
+        else
+          ndk=r29
+        fi
+        echo "ndk=$ndk" >> "$GITHUB_OUTPUT"
+        echo "frida $FRIDA_VERSION -> NDK $ndk"
+
     - name: Setup Android NDK
       id: setup-ndk
       uses: nttld/setup-ndk@v1
       with:
-        ndk-version: r29
+        ndk-version: ${{ steps.ndk.outputs.ndk }}
         local-cache: false
         link-to-sdk: true
 
