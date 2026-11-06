@@ -1,0 +1,196 @@
+name: Florida (manual)
+
+# Manual-only trigger. The upstream workflow relied on `schedule` + `getLatestRelease`,
+# which silently broke whenever upstream touched the patched files (e.g. frida 17.12
+# added docstrings to frida-core/lib/base/rpc.vala so patch 0001 stopped applying),
+# and `git am` is strict so a single fuzz-worthy offset kills the whole build.
+on:
+  workflow_dispatch:
+    inputs:
+      frida_version:
+        description: "Frida release tag to build (e.g. 17.26.0)"
+        required: true
+        default: "17.26.0"
+      arches:
+        description: "Targets"
+        type: choice
+        required: true
+        default: "android-arm64"
+        options:
+          - "android-arm64"
+          - "android-arm android-arm64"
+          - "android-arm android-arm64 android-x86 android-x86_64"
+
+permissions:
+  contents: write
+
+jobs:
+  android_build:
+    runs-on: ubuntu-22.04
+    env:
+      FRIDA_VERSION: ${{ inputs.frida_version }}
+      ARCHES: ${{ inputs.arches }}
+
+    steps:
+    - name: Show inputs
+      run: |
+        echo "FRIDA_VERSION=$FRIDA_VERSION"
+        echo "ARCHES=$ARCHES"
+
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 18
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: "temurin"
+        java-version: "17"
+
+    - name: Setup Android NDK
+      id: setup-ndk
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r29
+        local-cache: false
+        link-to-sdk: true
+
+    - name: Set up Python 3.9
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.9"
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        DEBIAN_FRONTEND=noninteractive sudo apt-get install -y \
+          build-essential tree ninja-build gcc-multilib g++-multilib \
+          lib32stdc++-9-dev flex bison ruby ruby-dev \
+          python3-requests python3-setuptools python3-dev python3-pip \
+          libc6-dev libc6-dev-i386 patch
+        sudo gem install fpm -v 1.11.0 --no-document
+        python3 -m pip install lief
+
+    - name: Clone frida at pinned tag and apply Florida patches
+      shell: bash
+      run: |
+        set -euo pipefail
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+        # Pinned tag instead of the default branch: upstream HEAD drifts away from
+        # the patch context constanty, and the released tags are what we test against.
+        git clone --recurse-submodules --depth 1 --branch "$FRIDA_VERSION" \
+          https://github.com/frida/frida frida
+
+        cd frida
+        echo "frida superrepo at: $(git describe --tags --always)"
+        echo "frida-core at: $(cd subprojects/frida-core && git describe --tags --always)"
+        echo "frida-gum  at: $(cd subprojects/frida-gum  && git describe --tags --always)"
+
+        for path in ../patches/*; do
+          name=$(basename "$path")
+          real=$(realpath "$path")
+          echo "=================================================================="
+          echo "== Apply patches in $real -> frida/subprojects/$name"
+          echo "=================================================================="
+          cd "subprojects/$name"
+          for p in "$real"/*.patch; do
+            pn=$(basename "$p")
+            echo "-- $pn"
+            # `patch --fuzz` instead of `git am`: upstream docstring/whitespace churn
+            # shifts context lines constantly, which is cosmetic here.
+            if ! patch -p1 -l --fuzz=10 --forward --batch < "$p"; then
+              echo "   !! failed, retrying with known path renames"
+              # upstream moved src/droidy/droidy-client.vala -> src/adb.vala
+              sed -e 's#src/droidy/droidy-client\.vala#src/adb.vala#g' "$p" > /tmp/rewritten.patch
+              patch -p1 -l --fuzz=10 --forward --batch < /tmp/rewritten.patch
+              echo "   ok after path rewrite"
+            fi
+            if find . -name '*.rej' | grep -q .; then
+              echo "!! $pn left reject files:"
+              find . -name '*.rej'
+              exit 1
+            fi
+          done
+          cd ../..
+        done
+
+        echo "== sanity check: patched markers present =="
+        grep -q 'getRpcStr' subprojects/frida-core/lib/base/rpc.vala \
+          && echo "OK rpc.vala frida:rpc obfuscated"
+        test -f subprojects/frida-core/src/anti-anti-frida.py \
+          && echo "OK anti-anti-frida.py present"
+        grep -q 'break; // throw new Error.PROTOCOL' subprojects/frida-core/src/droidy/droidy-client.vala 2>/dev/null \
+          || grep -q 'break; // throw new Error.PROTOCOL' subprojects/frida-core/src/adb.vala \
+          && echo "OK adb unexpected-command patched"
+
+    - name: Build frida for Android
+      shell: bash
+      run: |
+        set -euo pipefail
+        export ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}
+        echo "ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT"
+
+        for ARCH in $ARCHES; do
+          echo "### building $ARCH"
+          mkdir -p "build-$ARCH"
+          cd "build-$ARCH"
+          ../frida/configure --host="$ARCH"
+          make -j"$(nproc)"
+          cd ..
+        done
+
+    - name: Package assets
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p dist
+        for ARCH in $ARCHES; do
+          B="build-$ARCH/subprojects"
+          S="$(echo "$ARCH" | sed 's/^android-//')"
+          gzip -9 "$B/frida-core/server/frida-server"
+          cp "$B/frida-core/server/frida-server.gz" \
+             "dist/florida-server-${FRIDA_VERSION}-android-${S}.gz"
+          if [ -f "$B/frida-core/inject/frida-inject" ]; then
+            gzip -9 "$B/frida-core/inject/frida-inject"
+            cp "$B/frida-core/inject/frida-inject.gz" \
+               "dist/florida-inject-${FRIDA_VERSION}-android-${S}.gz"
+          fi
+          if [ -f "$B/frida-core/lib/gadget/frida-gadget.so" ]; then
+            gzip -9 "$B/frida-core/lib/gadget/frida-gadget.so"
+            cp "$B/frida-core/lib/gadget/frida-gadget.so.gz" \
+               "dist/florida-gadget-${FRIDA_VERSION}-android-${S}.so.gz"
+          fi
+          if [ -f "$B/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a" ]; then
+            gzip -9 "$B/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a"
+            cp "$B/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a.gz" \
+               "dist/florida-gumjs-${FRIDA_VERSION}-android-${S}.a.gz"
+          fi
+        done
+        ls -l dist
+        ( cd dist && sha256sum ./* > SHA256SUMS.txt )
+
+    - name: Upload workflow artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: florida-${{ inputs.frida_version }}
+        path: dist/*
+        if-no-files-found: error
+
+    - name: Publish to release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        TAG="$FRIDA_VERSION"
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          echo "release $TAG exists, uploading with --clobber"
+        else
+          gh release create "$TAG" --title "$TAG" \
+            --notes "Florida anti-detection frida-server, built from frida $TAG (manual build)."
+        fi
+        gh release upload "$TAG" dist/* --clobber
+        gh release view "$TAG" --json assets --jq '.assets[].name'
