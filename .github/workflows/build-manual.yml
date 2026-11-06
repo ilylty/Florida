@@ -104,12 +104,33 @@ jobs:
             echo "-- $pn"
             # `patch --fuzz` instead of `git am`: upstream docstring/whitespace churn
             # shifts context lines constantly, which is cosmetic here.
-            if ! patch -p1 -l --fuzz=10 --forward --batch < "$p"; then
-              echo "   !! failed, retrying with known path renames"
+            applied=0
+            if patch -p1 -l --fuzz=10 --forward --batch < "$p"; then
+              applied=1
+            else
+              echo "   !! direct apply failed, retrying with known path renames"
               # upstream moved src/droidy/droidy-client.vala -> src/adb.vala
               sed -e 's#src/droidy/droidy-client\.vala#src/adb.vala#g' "$p" > /tmp/rewritten.patch
-              patch -p1 -l --fuzz=10 --forward --batch < /tmp/rewritten.patch
-              echo "   ok after path rewrite"
+              if patch -p1 -l --fuzz=10 --forward --batch < /tmp/rewritten.patch; then
+                applied=1
+                echo "   ok after path rewrite"
+              fi
+            fi
+            if [ "$applied" != "1" ]; then
+              # Targeted fallbacks for patches that depend on internals which differ
+              # between frida releases.
+              case "$pn" in
+                0009-Florida-memfd-name-jit-cache.patch)
+                  echo "   !! falling back to fixup-memfd.py"
+                  python3 ../tools/fixup-memfd.py .
+                  applied=1
+                  rm -f lib/base/linux.vala.rej
+                  ;;
+              esac
+            fi
+            if [ "$applied" != "1" ]; then
+              echo "!! $pn could not be applied"
+              exit 1
             fi
             if find . -name '*.rej' | grep -q .; then
               echo "!! $pn left reject files:"
@@ -125,9 +146,10 @@ jobs:
           && echo "OK rpc.vala frida:rpc obfuscated"
         test -f subprojects/frida-core/src/anti-anti-frida.py \
           && echo "OK anti-anti-frida.py present"
-        grep -q 'break; // throw new Error.PROTOCOL' subprojects/frida-core/src/droidy/droidy-client.vala 2>/dev/null \
-          || grep -q 'break; // throw new Error.PROTOCOL' subprojects/frida-core/src/adb.vala \
+        grep -rq 'break; // throw new Error.PROTOCOL' subprojects/frida-core/src/ \
           && echo "OK adb unexpected-command patched"
+        grep -q 'jit-cache' subprojects/frida-core/lib/base/linux.vala \
+          && echo "OK memfd renamed to jit-cache"
 
     - name: Build frida for Android
       shell: bash

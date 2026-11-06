@@ -3,6 +3,9 @@ From: ada-l0velace <9060550+ada-l0velace@users.noreply.github.com>
 Date: Fri, 27 Mar 2026 17:35:21 +0000
 Subject: [PATCH] Florida: memfd-name-jit-cache
 
+The memfd name shows up in /proc/self/maps as "memfd:frida-agent", which is
+one of the cheapest things for an app to grep for. Rename it to something that
+looks like an ordinary JIT cache.
 ---
  lib/base/linux.vala | 2 +-
  1 file changed, 1 insertion(+), 1 deletion(-)
@@ -11,7 +14,7 @@ diff --git a/lib/base/linux.vala b/lib/base/linux.vala
 index 20837fb7..51b257af 100644
 --- a/lib/base/linux.vala
 +++ b/lib/base/linux.vala
-@@ -124,7 +124,7 @@ namespace Frida {
+@@ -120,7 +120,7 @@ namespace Frida {
  		}
  
  		private int memfd_create (string name, uint flags) {
